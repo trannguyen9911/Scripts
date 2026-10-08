@@ -1,2 +1,2 @@
-# Scripts-
+# Scripts
 Public ICM Scripts
