@@ -1,0 +1,438 @@
+# encoding: utf-8
+# =============================================================================
+# Delete a Run by database ID (InfoWorks ICM)
+# =============================================================================
+#
+# Permanently removes a Run (and its simulations) when normal delete in the
+# database tree fails — for example broken links to deleted rainfall or network
+# objects.
+#
+# Deletion is permanent: items are not sent to the Recycle Bin.
+#
+# How to run: Network → Run Ruby script (database must be open).
+# =============================================================================
+
+require 'json'
+require 'fileutils'
+require 'tmpdir'
+
+SCRIPT_PATH = File.expand_path(__FILE__)
+
+# --- CONFIGURATION ---
+# Integer ID of the Run object. Set to 0 to enter the ID when the script runs.
+RUN_ID = 0
+
+# true = report actions only; nothing is deleted
+DRY_RUN = false
+
+# If deletion fails in the UI session, retry using ICMExchange (separate process).
+USE_EXCHANGE_FALLBACK = true
+ICM_EXCHANGE_PATH = nil
+
+# false = quiet; true = write details to Script Output
+VERBOSE = false
+# --- END CONFIGURATION ---
+
+SIM_TYPES = ['Sim', 'Risk Analysis Sim'].freeze
+
+def log_msg(message)
+  puts message.to_s if VERBOSE
+end
+
+def icm_message_box(text, buttons = 'OK', icon = nil)
+  WSApplication.message_box(text.to_s, buttons, icon, false)
+end
+
+def safe_path(mo)
+  mo.path.to_s
+rescue StandardError
+  '(path unavailable)'
+end
+
+def find_model_object_in_tree(db, type, object_id)
+  target_type = type.to_s
+  target_id = object_id.to_i
+  queue = []
+  db.root_model_objects.each { |root| queue << root }
+
+  until queue.empty?
+    mo = queue.shift
+    next if mo.nil?
+
+    begin
+      if mo.type.to_s == target_type && mo.id.to_i == target_id
+        log_msg("Located #{target_type} ID #{target_id} at #{safe_path(mo)}")
+        return mo
+      end
+      mo.children.each { |child| queue << child }
+    rescue StandardError => e
+      log_msg("Tree walk skipped a branch: #{e.message}")
+    end
+  end
+
+  nil
+end
+
+def find_run(db, run_id)
+  find_model_object_in_tree(db, 'Run', run_id)
+end
+
+def collect_sims_for_run(db, run_id)
+  target = run_id.to_i
+  sims = []
+  seen = {}
+  queue = []
+  db.root_model_objects.each { |root| queue << root }
+
+  until queue.empty?
+    mo = queue.shift
+    next if mo.nil?
+
+    begin
+      if SIM_TYPES.include?(mo.type.to_s) && mo.parent_id.to_i == target
+        key = "#{mo.type}:#{mo.id}"
+        unless seen[key]
+          seen[key] = true
+          sims << { type: mo.type.to_s, id: mo.id.to_i }
+        end
+      end
+      mo.children.each { |child| queue << child }
+    rescue StandardError => e
+      log_msg("Tree walk skipped a branch: #{e.message}")
+    end
+  end
+
+  sims
+end
+
+def bulk_delete_in_tree(db, type, object_id)
+  mo = find_model_object_in_tree(db, type, object_id)
+  raise "No #{type} with ID #{object_id} in the database tree." if mo.nil?
+
+  mo.bulk_delete
+end
+
+def delete_run_bulk_only(db, run_id, dry_run)
+  run = find_run(db, run_id)
+  return { ok: false, error: "No Run found with ID #{run_id}." } if run.nil?
+
+  log_msg("Strategy: bulk_delete Run only (includes child sims)")
+  run.bulk_delete unless dry_run
+  { ok: true, strategy: 'run_bulk_only', run_id: run_id.to_i }
+rescue StandardError => e
+  { ok: false, error: e.message, strategy: 'run_bulk_only' }
+end
+
+def delete_sims_then_run(db, run_id, dry_run)
+  sims = collect_sims_for_run(db, run_id)
+  log_msg("Strategy: delete #{sims.length} simulation(s) by ID, then Run")
+
+  sims.each do |sim|
+    log_msg("bulk_delete #{sim[:type]} ID #{sim[:id]}")
+    bulk_delete_in_tree(db, sim[:type], sim[:id]) unless dry_run
+  end
+
+  unless dry_run
+    run = find_run(db, run_id)
+    raise "Run ID #{run_id} no longer found after deleting simulations." if run.nil?
+
+    run.bulk_delete
+  end
+
+  { ok: true, strategy: 'sims_then_run', run_id: run_id.to_i, sims: sims }
+rescue StandardError => e
+  { ok: false, error: e.message, strategy: 'sims_then_run' }
+end
+
+def delete_sim_results_then_bulk(db, run_id, dry_run)
+  sims = collect_sims_for_run(db, run_id)
+  log_msg("Strategy: delete_results on sims, then bulk_delete sims and Run")
+
+  sims.each do |sim|
+    sim_mo = find_model_object_in_tree(db, sim[:type], sim[:id])
+    next if sim_mo.nil?
+
+    log_msg("delete_results #{sim[:type]} ID #{sim[:id]}")
+    sim_mo.delete_results unless dry_run
+  end
+
+  sims.each do |sim|
+    log_msg("bulk_delete #{sim[:type]} ID #{sim[:id]}")
+    bulk_delete_in_tree(db, sim[:type], sim[:id]) unless dry_run
+  end
+
+  unless dry_run
+    run = find_run(db, run_id)
+    raise "Run ID #{run_id} no longer found." if run.nil?
+
+    run.bulk_delete
+  end
+
+  { ok: true, strategy: 'sim_results_then_bulk', run_id: run_id.to_i, sims: sims }
+rescue StandardError => e
+  { ok: false, error: e.message, strategy: 'sim_results_then_bulk' }
+end
+
+DELETE_STRATEGIES = [
+  [:delete_run_bulk_only, 'Delete Run (and child sims) in one bulk_delete'],
+  [:delete_sims_then_run, 'Delete each Sim by ID, then delete Run'],
+  [:delete_sim_results_then_bulk, 'Delete sim results, then sims, then Run']
+].freeze
+
+def delete_run_by_id(db, run_id, dry_run)
+  run = find_run(db, run_id)
+  if run.nil?
+    return {
+      ok: false,
+      error: "Run ID #{run_id} was not found in this database. Check the ID and try again."
+    }
+  end
+
+  sims = collect_sims_for_run(db, run_id)
+  sim_label = sims.map { |s| "#{s[:type]} #{s[:id]}" }.join(', ')
+  log_msg("Run ID #{run_id}, simulations found by tree walk: #{sim_label}")
+
+  if dry_run
+    return { ok: true, dry_run: true, run_id: run.id.to_i, sim_ids: sims.map { |s| s[:id] } }
+  end
+
+  last_error = nil
+  DELETE_STRATEGIES.each do |method_sym, label|
+    log_msg("Trying: #{label}")
+    outcome = send(method_sym, db, run_id, false)
+    return outcome if outcome[:ok]
+
+    last_error = outcome[:error]
+    log_msg("Failed (#{outcome[:strategy]}): #{last_error}")
+  end
+
+  { ok: false, error: last_error || 'All delete strategies failed.' }
+end
+
+def resolve_run_id(configured_id)
+  id = configured_id.to_i
+  return id if id.positive?
+
+  text = WSApplication.input_box(
+    "Enter the Run ID (whole number) to delete permanently.\n\n" \
+    'You can find the ID in the database tree (for example via object properties on the Run).',
+    'Delete Run by ID',
+    ''
+  )
+  return nil if text.nil?
+
+  text.to_s.strip.to_i
+end
+
+def database_path_for(db)
+  %i[path database_path location file_path].each do |meth|
+    next unless db.respond_to?(meth)
+
+    val = db.send(meth).to_s.strip
+    return val unless val.empty?
+  end
+  nil
+rescue StandardError
+  nil
+end
+
+def find_icm_exchange
+  if ICM_EXCHANGE_PATH && !ICM_EXCHANGE_PATH.to_s.strip.empty?
+    path = File.expand_path(ICM_EXCHANGE_PATH.to_s)
+    return path if File.file?(path)
+  end
+
+  patterns = [
+    'C:/Program Files/Autodesk/InfoWorks ICM Ultimate */ICMExchange.exe',
+    'C:/Program Files/Autodesk/InfoWorks ICM Ultimate x64 */ICMExchange.exe',
+    'C:/Program Files/Autodesk/InfoWorks ICM */ICMExchange.exe'
+  ]
+  paths = []
+  patterns.each { |pattern| paths.concat(Dir.glob(pattern.tr('\\', '/'))) }
+  paths.uniq.select { |p| File.file?(p) }.sort.reverse.first
+rescue StandardError
+  nil
+end
+
+def exchange_argv_token_skip?(arg)
+  a = arg.to_s
+  return true if a =~ /\A\//
+  return true if %w[ADSK ICM IA WS Autodesk].include?(a)
+
+  false
+end
+
+def running_via_icm_exchange?
+  first = ARGV[0].to_s
+  return true if first == 'ADSK'
+  return true if first == 'ICM'
+
+  ARGV.any? { |a| a.to_s =~ /\A\/ICM/i }
+end
+
+def export_job_path_from_argv
+  ARGV.each do |arg|
+    next if exchange_argv_token_skip?(arg)
+
+    path = arg.to_s
+    return path if path.end_with?('.json') && File.file?(path)
+  end
+  nil
+end
+
+def running_exchange_job?
+  path = export_job_path_from_argv
+  return false if path.nil?
+  return true if running_via_icm_exchange?
+
+  job = JSON.parse(File.read(path))
+  job.is_a?(Hash) && job.key?('run_id')
+rescue StandardError
+  false
+end
+
+def open_db_from_job(job)
+  db_path = job['database_path'].to_s.strip
+  db = nil
+  unless db_path.empty?
+    begin
+      db = WSApplication.open(db_path, false)
+    rescue StandardError => e
+      log_msg("Could not open database: #{e.message}")
+    end
+  end
+  db ||= WSApplication.current_database
+  db ||= WSApplication.open
+  raise 'Could not open the database.' if db.nil?
+
+  expected = job['database_guid']
+  if expected && db.respond_to?(:guid) && db.guid.to_s != expected.to_s
+    raise 'Exchange connected to a different database than the one open in ICM.'
+  end
+  db
+end
+
+def write_delete_job(db, run_id, dry_run)
+  staging = File.join(Dir.tmpdir, 'icm_run_delete_jobs', "delete_#{Process.pid}_#{Time.now.strftime('%Y%m%d_%H%M%S')}")
+  FileUtils.mkdir_p(staging)
+  job = {
+    'database_guid' => (db.guid if db.respond_to?(:guid)),
+    'database_path' => database_path_for(db),
+    'run_id' => run_id.to_i,
+    'dry_run' => dry_run ? true : false
+  }
+  job_path = File.join(staging, 'job.json')
+  File.open(job_path, 'w:UTF-8') { |f| f.write(JSON.pretty_generate(job)) }
+  { job_path: job_path, staging: staging }
+end
+
+def launch_exchange_delete(job_bundle)
+  exchange = find_icm_exchange
+  return false if exchange.nil?
+
+  command = "\"#{exchange}\" \"#{SCRIPT_PATH}\" \"#{job_bundle[:job_path]}\""
+  log_msg("Starting ICMExchange: #{command}")
+  success = false
+  require 'open3'
+  Open3.popen2e(command) do |_stdin, stdout_and_stderr, wait_thr|
+    stdout_and_stderr.each { |line| log_msg(line.chomp) }
+    success = wait_thr.value.success?
+  end
+  success
+rescue StandardError => e
+  log_msg("Exchange delete failed: #{e.message}")
+  false
+ensure
+  FileUtils.rm_rf(job_bundle[:staging]) if job_bundle[:staging]
+end
+
+def run_delete_job(job)
+  run_id = job['run_id'].to_i
+  dry_run = job['dry_run'] ? true : false
+  db = open_db_from_job(job)
+  outcome = delete_run_by_id(db, run_id, dry_run)
+  db.close if db.respond_to?(:close) && !dry_run
+  raise outcome[:error] unless outcome[:ok]
+
+  true
+rescue StandardError => e
+  log_msg("Job error: #{e.message}")
+  false
+end
+
+def run_from_ui
+  db = WSApplication.current_database
+  if db.nil?
+    icm_message_box('Open a database in InfoWorks ICM, then run this script again.', 'OK', '!')
+    return
+  end
+
+  run_id = resolve_run_id(RUN_ID)
+  if run_id.nil? || run_id <= 0
+    icm_message_box('A valid Run ID is required.', 'OK', '!')
+    return
+  end
+
+  preview = delete_run_by_id(db, run_id, true)
+  unless preview[:ok]
+    icm_message_box(preview[:error], 'OK', '!')
+    return
+  end
+
+  sim_count = preview[:sim_ids].length
+  action = DRY_RUN ? 'Dry run — no data will be deleted' : 'Permanently delete this Run?'
+  detail = "Run ID #{preview[:run_id]}\nSimulations under this run: #{sim_count}\n\n" \
+           "The Run and its simulations will be removed permanently.\n" \
+           "They will NOT be moved to the Recycle Bin and cannot be restored from there.\n\n" \
+           "Make sure this is the correct Run ID before you continue.\n\n" \
+           'This action cannot be undone.'
+
+  confirm = icm_message_box("#{action}\n\n#{detail}", 'YesNo', '?')
+  return unless confirm == 'Yes'
+
+  outcome = delete_run_by_id(db, run_id, DRY_RUN)
+  if !outcome[:ok] && USE_EXCHANGE_FALLBACK && !DRY_RUN
+    log_msg('Retrying via ICMExchange...')
+    job_bundle = write_delete_job(db, run_id, false)
+    if launch_exchange_delete(job_bundle)
+      icm_message_box(
+        "Run ID #{run_id} was deleted.\n\nCommit the database if your workflow requires it.",
+        'OK',
+        'Information'
+      )
+      return
+    end
+  end
+
+  unless outcome[:ok]
+    icm_message_box(
+      "The Run could not be deleted.\n\n#{outcome[:error]}\n\n" \
+      'Set VERBOSE = true at the top of the script and check Script Output for details.',
+      'OK',
+      '!'
+    )
+    return
+  end
+
+  if DRY_RUN
+    icm_message_box(
+      "Dry run complete.\n\nRun ID #{run_id} would be permanently deleted (#{sim_count} simulation(s)).",
+      'OK',
+      'Information'
+    )
+  else
+    icm_message_box(
+      "Run ID #{run_id} was deleted permanently.\n\nCommit the database if your workflow requires it.",
+      'OK',
+      'Information'
+    )
+  end
+end
+
+if running_exchange_job?
+  job_path = export_job_path_from_argv
+  success = run_delete_job(JSON.parse(File.read(job_path)))
+  exit(success ? 0 : 1)
+end
+
+run_from_ui
