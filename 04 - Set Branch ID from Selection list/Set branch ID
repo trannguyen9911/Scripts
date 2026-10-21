@@ -1,0 +1,280 @@
+# Set Branch ID from selection lists
+#
+# Sets each pipe's Branch ID from the selection list(s) it belongs to. The Branch
+# ID matches the selection list name (one list = one branch).
+#
+# How to run
+#   1. Open the network on the GeoPlan.
+#   2. Network → Run Ruby script → choose this file.
+#   3. Resolve any conflict prompts, then read the summary dialog.
+#
+# Notes
+#   - All Selection Lists in your selection-list subfolder are used (any names).
+#   - A pipe in exactly one list gets Branch ID = that list's name.
+#   - A pipe in multiple lists triggers a warning and a manual Branch ID prompt.
+#   - Changes are saved to the network when the script finishes.
+#
+# --- Optional configuration ---
+# Exact name of the child folder that stores selection lists (as shown in the tree).
+# Leave nil to detect the folder automatically (same as script 0103).
+SELECTION_LIST_FOLDER_NAME = nil
+
+FOLDER_NAME_CANDIDATES = [
+  'Selection Lists',
+  'Selection lists',
+  'Selection List',
+  'Selection list'
+].freeze
+
+def parent_model_group(db, net)
+  parent_id = net.model_object.parent_id
+  begin
+    db.model_object_from_type_and_id('Model Group', parent_id)
+  rescue StandardError
+    network_mo = db.model_object_from_type_and_id('Model Network', parent_id)
+    db.model_object_from_type_and_id('Model Group', network_mo.parent_id)
+  end
+end
+
+def folder_stores_only_selection_lists?(folder)
+  seen_list = false
+  folder.children.each do |child|
+    case child.type
+    when 'Selection List'
+      seen_list = true
+    when 'Selection List Group'
+      next
+    else
+      return false
+    end
+  end
+  seen_list
+end
+
+def selection_list_folder(parent_group)
+  explicit = SELECTION_LIST_FOLDER_NAME.to_s.strip
+  unless explicit.empty?
+    parent_group.children.each do |child|
+      next unless child.type == 'Model Group' || child.type == 'Selection List Group'
+      return child if child.name.casecmp(explicit).zero?
+    end
+    return nil
+  end
+
+  parent_group.children.each do |child|
+    return child if child.type == 'Selection List Group'
+  end
+
+  FOLDER_NAME_CANDIDATES.each do |candidate|
+    parent_group.children.each do |child|
+      next unless child.type == 'Model Group'
+      return child if child.name.casecmp(candidate).zero?
+    end
+  end
+
+  list_only_groups = []
+  parent_group.children.each do |child|
+    next unless child.type == 'Model Group'
+    list_only_groups << child if folder_stores_only_selection_lists?(child)
+  end
+  list_only_groups.size == 1 ? list_only_groups[0] : nil
+end
+
+def all_selection_lists_in_folder(folder)
+  lists = []
+  folder.children.each do |child|
+    case child.type
+    when 'Selection List'
+      lists << child
+    when 'Selection List Group'
+      child.children.each do |nested|
+        lists << nested if nested.type == 'Selection List'
+      end
+    end
+  end
+  lists.sort_by { |sl| sl.name.to_s.downcase }
+end
+
+def link_key(link)
+  id = link.id
+  return id.to_s unless id.nil? || id.to_s.strip.empty?
+
+  "#{link.us_node_id}|#{link.link_suffix}"
+end
+
+def pipe_label(link)
+  suffix = link.link_suffix.to_s
+  suffix.empty? ? link.us_node_id.to_s : "#{link.us_node_id}.#{suffix}"
+end
+
+def format_selection_lists_phrase(list_names)
+  parts = list_names.map { |name| "Selection lists #{name}" }
+  return parts[0] if parts.length == 1
+  return "#{parts[0]} and #{parts[1]}" if parts.length == 2
+
+  "#{parts[0..-2].join(', ')} and #{parts[-1]}"
+end
+
+def summarize_list_names_for_dialog(list_names)
+  return '(none)' if list_names.empty?
+  return list_names.join(', ') if list_names.length <= 6
+
+  "#{list_names.length} lists (see Script Output for full list)"
+end
+
+def format_manual_conflict_line(pipe_id, list_names, branch_id)
+  "Pipe #{pipe_id} | #{format_selection_lists_phrase(list_names)} | Selected Branch ID: #{branch_id}"
+end
+
+def build_pipe_membership(net, selection_lists)
+  membership = {}
+
+  net.clear_selection
+  selection_lists.each do |list_mo|
+    list_name = list_mo.name
+    net.clear_selection
+    net.load_selection(list_mo)
+
+    net.row_objects_selection('_links').each do |link|
+      key = link_key(link)
+      entry = membership[key]
+      if entry.nil?
+        membership[key] = { link: link, lists: [list_name] }
+      elsif !entry[:lists].include?(list_name)
+        entry[:lists] << list_name
+      end
+    end
+  end
+  net.clear_selection
+
+  membership.each_value { |entry| entry[:lists].sort! }
+  membership
+end
+
+def prompt_branch_id_for_conflict(pipe_id, list_names)
+  WSApplication.message_box(
+    "Branch ID conflicts at pipe #{pipe_id} | #{format_selection_lists_phrase(list_names)}",
+    'OK',
+    '!',
+    false
+  )
+
+  loop do
+    value = WSApplication.input_box(
+      "Enter Branch ID for pipe #{pipe_id}:",
+      'Branch ID conflict',
+      list_names[0].to_s
+    )
+    return nil if value.nil?
+
+    value = value.strip
+    return value unless value.empty?
+
+    WSApplication.message_box(
+      'Branch ID cannot be empty. Enter a value or click Cancel to skip this pipe.',
+      'OK',
+      '!',
+      false
+    )
+  end
+end
+
+def set_branch_id_from_selection_lists
+  net = WSApplication.current_network
+  db = WSApplication.current_database
+
+  parent_group = parent_model_group(db, net)
+  folder = selection_list_folder(parent_group)
+  if folder.nil?
+    WSApplication.message_box(
+      "Could not find a selection-list folder under model group \"#{parent_group.name}\".\n\n" \
+      "Add a child Model Group or Selection List Group for your lists, or ask your administrator " \
+      'to set SELECTION_LIST_FOLDER_NAME at the top of this script to the exact folder name.',
+      'OK',
+      '!',
+      false
+    )
+    return
+  end
+
+  selection_lists = all_selection_lists_in_folder(folder)
+  if selection_lists.empty?
+    WSApplication.message_box(
+      "No selection lists were found in \"#{folder.name}\".\n\n" \
+      'Create one Selection List per branch in that folder, then run this script again.',
+      'OK',
+      '!',
+      false
+    )
+    return
+  end
+
+  list_names = selection_lists.map(&:name)
+  puts "Selection lists (#{list_names.length}): #{list_names.join(', ')}"
+
+  membership = build_pipe_membership(net, selection_lists)
+  if membership.empty?
+    WSApplication.message_box(
+      "No pipes were found in the selection lists in \"#{folder.name}\".\n\n" \
+      'Check that each list contains links, then run this script again.',
+      'OK',
+      '!',
+      false
+    )
+    return
+  end
+
+  updated = 0
+  skipped = 0
+  manual_resolutions = []
+
+  net.transaction_begin
+  membership.each_value do |entry|
+    link = entry[:link]
+    lists = entry[:lists]
+    label = pipe_label(link)
+
+    branch_id =
+      if lists.length == 1
+        lists[0]
+      else
+        value = prompt_branch_id_for_conflict(label, lists)
+        if value.nil?
+          skipped += 1
+          next
+        end
+        manual_resolutions << { pipe_id: label, lists: lists, branch_id: value }
+        value
+      end
+
+    link.branch_id = branch_id
+    link.write
+    updated += 1
+  end
+  net.transaction_commit
+
+  net.commit("Set Branch ID from selection lists (#{updated} pipes)")
+
+  summary_lines = [
+    "Folder: #{folder.name}",
+    "Selection lists: #{summarize_list_names_for_dialog(list_names)}",
+    "Branch IDs updated: #{updated} pipe(s)",
+    "Skipped (cancelled at prompt): #{skipped}"
+  ]
+
+  if manual_resolutions.empty?
+    summary_lines << 'Manual conflict resolutions: none'
+  else
+    summary_lines << "Manual conflict resolutions (#{manual_resolutions.length}):"
+    manual_resolutions.each do |row|
+      summary_lines << "  #{format_manual_conflict_line(row[:pipe_id], row[:lists], row[:branch_id])}"
+    end
+  end
+
+  summary = summary_lines.join("\n")
+
+  puts summary
+  WSApplication.message_box(summary, 'OK', 'Information', false)
+end
+
+set_branch_id_from_selection_lists
